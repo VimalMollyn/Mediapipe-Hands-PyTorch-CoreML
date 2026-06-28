@@ -136,6 +136,31 @@ class WHIMDetectorDataset(Dataset):
         return (torch.from_numpy(inp), torch.from_numpy(loc), torch.from_numpy(cls))
 
 
+def load_image_and_gt(npy_path):
+    """For visualization: 192x192 letterbox input (float RGB [0,1]) + GT hand
+    boxes in letterbox-normalized xyxy. Mirrors the dataset's letterbox."""
+    bgr = cv2.imread(npy_path[:-4] + ".jpg")
+    if bgr is None:
+        return np.zeros((DETECT_SIZE, DETECT_SIZE, 3), np.float32), np.zeros((0, 4), np.float32)
+    ih, iw = bgr.shape[:2]
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    side = max(iw, ih)
+    inp = crop_rotated_rect(rgb, F(0.5) * F(iw), F(0.5) * F(ih), side, side,
+                            0.0, DETECT_SIZE, cv2.BORDER_CONSTANT)
+
+    def to_lb(px, py):
+        return (px - iw / 2) / side + 0.5, (py - ih / 2) / side + 0.5
+
+    boxes = []
+    for h in np.load(npy_path, allow_pickle=True):
+        b = np.asarray(h["bbox"], dtype=np.float64)
+        x1, y1 = to_lb(b[0], b[1])
+        x2, y2 = to_lb(b[2], b[3])
+        boxes.append([min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)])
+    boxes = np.array(boxes, np.float32) if boxes else np.zeros((0, 4), np.float32)
+    return inp, boxes
+
+
 class WHIMDataModule(L.LightningDataModule):
     def __init__(self, batch_size=32, num_workers=6, train_subset=0, val_subset=2000,
                  seed=0):

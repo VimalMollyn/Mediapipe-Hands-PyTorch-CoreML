@@ -18,6 +18,8 @@ import argparse
 import math
 import os
 
+import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -25,8 +27,12 @@ import lightning as L
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 
+from fasthands.pipeline import (DETECT_SIZE, decode_detections, generate_anchors,
+                                weighted_nms)
 from tflite_graph import TFLiteModule
-from whim_data import WHIMDataModule
+from whim_data import WHIMDataModule, load_image_and_gt
+
+N_VIZ = 8  # number of fixed val frames visualized in wandb each validation
 
 
 def load_trainable_detector(path):
@@ -65,6 +71,8 @@ class DetectorLit(L.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.net = load_trainable_detector(detector_path)
+        self.anchors = generate_anchors()        # [2016,4] for decoding viz preds
+        self._viz = None                         # fixed (inputs, gt_boxes) for logging
 
     def forward(self, x):
         loc, score = self.net(x)             # [N,2016,18], [N,2016,1]
@@ -110,6 +118,47 @@ class DetectorLit(L.LightningModule):
 
     def validation_step(self, batch, _):
         return self._step(batch, "val")
+
+    # ---- log example images with GT (green) + predicted (red) boxes to wandb ----
+    def _build_viz_set(self):
+        frames = self.trainer.datamodule.val_set.frames
+        idxs = np.linspace(0, len(frames) - 1, min(N_VIZ, len(frames))).astype(int)
+        imgs = [load_image_and_gt(frames[i]) for i in idxs]
+        self._viz = (np.stack([a for a, _ in imgs]), [b for _, b in imgs])
+
+    @torch.no_grad()
+    def on_validation_epoch_end(self):
+        if self.trainer.sanity_checking or self.global_rank != 0:
+            return
+        if not isinstance(self.logger, WandbLogger):
+            return
+        if self._viz is None:
+            self._build_viz_set()
+        inputs, gts = self._viz
+        x = torch.from_numpy(inputs).to(self.device)
+        loc, score = self(x)
+        S = DETECT_SIZE
+        images, captions = [], []
+        for b in range(len(inputs)):
+            canvas = (inputs[b] * 255).astype(np.uint8).copy()  # RGB
+            for g in gts[b]:                                    # GT green
+                cv2.rectangle(canvas, (int(g[0] * S), int(g[1] * S)),
+                              (int(g[2] * S), int(g[3] * S)), (0, 255, 0), 2)
+            raw_b = loc[b].float().cpu().numpy()
+            raw_s = score[b].float().cpu().numpy()[:, None]
+            dets = weighted_nms(decode_detections(raw_b, raw_s, self.anchors))
+            dets = sorted(dets, key=lambda d: -d["score"])[:10]
+            for d in dets:                                      # predicted red
+                x1, y1 = int(d["xmin"] * S), int(d["ymin"] * S)
+                x2 = int((d["xmin"] + d["w"]) * S)
+                y2 = int((d["ymin"] + d["h"]) * S)
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 0, 0), 1)
+                cv2.putText(canvas, f"{float(d['score']):.2f}", (x1, max(y1 - 2, 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
+            images.append(canvas)
+            captions.append(f"gt={len(gts[b])} pred={len(dets)}")
+        self.logger.log_image(key="val/detections", images=images,
+                              caption=captions, step=self.global_step)
 
     def configure_optimizers(self):
         opt = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr,
