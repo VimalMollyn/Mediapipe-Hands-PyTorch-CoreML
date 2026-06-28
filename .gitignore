@@ -5,3 +5,8 @@ output_*
 dist/
 models/*.pte
 output_mlx*
+# WHIM continue-training artifacts
+checkpoints/
+wandb/
+*.log
+models/hand_detector_whim.pt
