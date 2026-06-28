@@ -15,6 +15,7 @@ After training, the tuned weights are written back into the graph format at
 eval_detector_bbox.py can load it directly.
 """
 import argparse
+import math
 import os
 
 import torch
@@ -59,7 +60,8 @@ def export_graph(net, orig_path, out_path):
 
 class DetectorLit(L.LightningModule):
     def __init__(self, detector_path="models/hand_detector.pt", lr=1e-4, wd=1e-4,
-                 focal_alpha=0.25, focal_gamma=2.0, box_w=1.0, kp_w=0.5, cls_w=1.0):
+                 warmup_steps=1000, focal_alpha=0.25, focal_gamma=2.0,
+                 box_w=1.0, kp_w=0.5, cls_w=1.0):
         super().__init__()
         self.save_hyperparameters()
         self.net = load_trainable_detector(detector_path)
@@ -110,8 +112,20 @@ class DetectorLit(L.LightningModule):
         return self._step(batch, "val")
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.hparams.lr,
-                                 weight_decay=self.hparams.wd)
+        opt = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr,
+                                weight_decay=self.hparams.wd)
+        total = int(self.trainer.estimated_stepping_batches)
+        warmup = min(self.hparams.warmup_steps, max(total - 1, 1))
+
+        def lr_lambda(step):  # linear warmup -> cosine decay to 0 over all steps
+            if step < warmup:
+                return (step + 1) / warmup
+            progress = (step - warmup) / max(total - warmup, 1)
+            return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+        return {"optimizer": opt,
+                "lr_scheduler": {"scheduler": sched, "interval": "step"}}
 
 
 def main():
@@ -123,6 +137,8 @@ def main():
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--num-workers", type=int, default=6)
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--warmup-steps", type=int, default=1000)
+    ap.add_argument("--ckpt-every", type=int, default=2000, help="keep a checkpoint every N steps")
     ap.add_argument("--kp-w", type=float, default=0.5)
     ap.add_argument("--max-steps", type=int, default=-1)
     ap.add_argument("--max-epochs", type=int, default=5)
@@ -140,22 +156,27 @@ def main():
 
     dm = WHIMDataModule(batch_size=args.batch_size, num_workers=args.num_workers,
                         train_subset=args.train_subset, val_subset=args.val_subset)
-    model = DetectorLit(detector_path=args.detector, lr=args.lr, kp_w=args.kp_w)
+    model = DetectorLit(detector_path=args.detector, lr=args.lr, kp_w=args.kp_w,
+                        warmup_steps=args.warmup_steps)
 
     logger = WandbLogger(project=args.wandb_project, name=args.run_name,
                          offline=args.offline, log_model=False)
     logger.log_hyperparams(vars(args))
 
-    ckpt = ModelCheckpoint(dirpath="checkpoints", monitor="val/loss", mode="min",
-                           save_top_k=2, save_last=True, filename="det-step{step}",
-                           auto_insert_metric_name=False)
+    # keep ALL checkpoints on a fixed step cadence (+ last), plus the best by val
+    ckpt_all = ModelCheckpoint(dirpath="checkpoints", every_n_train_steps=args.ckpt_every,
+                               save_top_k=-1, save_last=True, filename="det-step{step}",
+                               auto_insert_metric_name=False)
+    ckpt_best = ModelCheckpoint(dirpath="checkpoints", monitor="val/loss", mode="min",
+                                save_top_k=3, filename="best-step{step}-{val/loss:.3f}",
+                                auto_insert_metric_name=False)
     trainer = L.Trainer(
         accelerator="gpu", devices=[args.device], precision=args.precision,
         max_steps=args.max_steps, max_epochs=args.max_epochs,
         val_check_interval=args.val_check_interval,
         limit_val_batches=args.limit_val_batches,
         log_every_n_steps=10, logger=logger,
-        callbacks=[ckpt, LearningRateMonitor(logging_interval="step")],
+        callbacks=[ckpt_all, ckpt_best, LearningRateMonitor(logging_interval="step")],
         gradient_clip_val=10.0,
     )
     trainer.fit(model, dm)
