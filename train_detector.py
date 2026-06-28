@@ -35,6 +35,27 @@ from whim_data import WHIMDataModule, load_image_and_gt
 N_VIZ = 8  # number of fixed val frames visualized in wandb each validation
 
 
+def bbox_ciou_loss(pred, target, eps=1e-7):
+    """Complete-IoU loss (Zheng et al.) per box. pred/target: [N,4] xyxy.
+    This is the WiLoR detector's L_CIoU term (iou + center-distance + aspect)."""
+    px1, py1, px2, py2 = pred.unbind(-1)
+    tx1, ty1, tx2, ty2 = target.unbind(-1)
+    pw, ph = (px2 - px1).clamp(min=eps), (py2 - py1).clamp(min=eps)
+    tw, th = (tx2 - tx1).clamp(min=eps), (ty2 - ty1).clamp(min=eps)
+    inter = ((torch.min(px2, tx2) - torch.max(px1, tx1)).clamp(min=0)
+             * (torch.min(py2, ty2) - torch.max(py1, ty1)).clamp(min=0))
+    union = pw * ph + tw * th - inter + eps
+    iou = inter / union
+    cw = torch.max(px2, tx2) - torch.min(px1, tx1)
+    ch = torch.max(py2, ty2) - torch.min(py1, ty1)
+    c2 = cw * cw + ch * ch + eps
+    rho2 = ((px1 + px2 - tx1 - tx2) ** 2 + (py1 + py2 - ty1 - ty2) ** 2) / 4
+    v = (4 / math.pi ** 2) * (torch.atan(tw / th) - torch.atan(pw / ph)) ** 2
+    with torch.no_grad():
+        alpha = v / (1 - iou + v + eps)
+    return 1 - (iou - rho2 / c2 - alpha * v)
+
+
 def load_trainable_detector(path):
     """TFLiteModule with its float weight-buffers promoted to nn.Parameter."""
     net = TFLiteModule(path)
@@ -67,11 +88,13 @@ def export_graph(net, orig_path, out_path):
 class DetectorLit(L.LightningModule):
     def __init__(self, detector_path="models/hand_detector.pt", lr=1e-4, wd=1e-4,
                  warmup_steps=1000, viz_every=2000, focal_alpha=0.25, focal_gamma=2.0,
-                 box_w=1.0, kp_w=0.5, cls_w=1.0):
+                 box_w=1.0, kp_w=0.5, cls_w=1.0, ciou_w=5.0):
         super().__init__()
         self.save_hyperparameters()
         self.net = load_trainable_detector(detector_path)
         self.anchors = generate_anchors()        # [2016,4] for decoding viz preds
+        self.register_buffer("anchor_cxcy",      # [2016,2] for CIoU box decoding
+                             torch.tensor(self.anchors[:, :2], dtype=torch.float32))
         self._viz_val = None                     # fixed (inputs, gt_boxes) per split
         self._viz_train = None
 
@@ -101,18 +124,35 @@ class DetectorLit(L.LightningModule):
                                         reduction="sum") / npos
             kp_loss = F.smooth_l1_loss(loc_p[..., 4:][pos], loc_t[..., 4:][pos],
                                        reduction="sum") / npos
+            ciou_loss = self._ciou(loc_p, loc_t, pos)
         else:
-            box_loss = kp_loss = torch.zeros((), device=inp.device)
+            box_loss = kp_loss = ciou_loss = torch.zeros((), device=inp.device)
         loss = (self.hparams.cls_w * cls_loss + self.hparams.box_w * box_loss
-                + self.hparams.kp_w * kp_loss)
+                + self.hparams.ciou_w * ciou_loss + self.hparams.kp_w * kp_loss)
 
         bs = inp.shape[0]
         self.log_dict({f"{tag}/loss": loss, f"{tag}/cls": cls_loss,
-                       f"{tag}/box": box_loss, f"{tag}/kp": kp_loss,
-                       f"{tag}/pos_per_img": npos / bs},
+                       f"{tag}/box": box_loss, f"{tag}/ciou": ciou_loss,
+                       f"{tag}/kp": kp_loss, f"{tag}/pos_per_img": npos / bs},
                       prog_bar=(tag == "train"), batch_size=bs,
                       on_step=(tag == "train"), on_epoch=(tag == "val"), sync_dist=True)
         return loss
+
+    def _ciou(self, loc_p, loc_t, pos):
+        """CIoU loss over positive anchors: decode (dx,dy,w,h)->xyxy (letterbox
+        norm) for pred & target using each anchor's centre, then CIoU."""
+        S = DETECT_SIZE
+        ac = self.anchor_cxcy.unsqueeze(0).expand(pos.shape[0], -1, -1)[pos]  # [P,2]
+        acx, acy = ac[:, 0], ac[:, 1]
+
+        def decode(loc):
+            cx = loc[:, 0] / S + acx
+            cy = loc[:, 1] / S + acy
+            w = loc[:, 2] / S
+            h = loc[:, 3] / S
+            return torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], -1)
+
+        return bbox_ciou_loss(decode(loc_p[pos]), decode(loc_t[pos])).mean()
 
     def training_step(self, batch, _):
         return self._step(batch, "train")
@@ -208,6 +248,7 @@ def main():
     ap.add_argument("--ckpt-every", type=int, default=2000, help="keep a checkpoint every N steps")
     ap.add_argument("--viz-every", type=int, default=2000, help="log train detections every N steps")
     ap.add_argument("--kp-w", type=float, default=0.5)
+    ap.add_argument("--ciou-w", type=float, default=5.0, help="CIoU box loss weight (WiLoR uses CIoU)")
     ap.add_argument("--max-steps", type=int, default=-1)
     ap.add_argument("--max-epochs", type=int, default=5)
     ap.add_argument("--val-check-interval", type=float, default=1.0)
@@ -225,7 +266,8 @@ def main():
     dm = WHIMDataModule(batch_size=args.batch_size, num_workers=args.num_workers,
                         train_subset=args.train_subset, val_subset=args.val_subset)
     model = DetectorLit(detector_path=args.detector, lr=args.lr, kp_w=args.kp_w,
-                        warmup_steps=args.warmup_steps, viz_every=args.viz_every)
+                        warmup_steps=args.warmup_steps, viz_every=args.viz_every,
+                        ciou_w=args.ciou_w)
 
     logger = WandbLogger(project=args.wandb_project, name=args.run_name,
                          offline=args.offline, log_model=False)
