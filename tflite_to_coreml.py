@@ -36,6 +36,8 @@ def main():
                         help="detector graph .pt (e.g. a fine-tuned *_whim.pt)")
     parser.add_argument("--landmark", default="models/hand_landmarks_detector.pt",
                         help="landmark graph .pt (e.g. a fine-tuned *_whim.pt)")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="skip the predict() sanity check (needs macOS runtime)")
     args = parser.parse_args()
 
     precision = ct.precision.FLOAT32 if args.fp32 else ct.precision.FLOAT16
@@ -60,8 +62,11 @@ def main():
         )
         out_path = out_tmpl.format(suffix=suffix)
         mlmodel.save(out_path)
+        print(f"saved {out_path}", flush=True)
 
-        # sanity check against the torch module
+        if args.no_verify:
+            continue
+        # sanity check against the torch module (needs the macOS CoreML runtime)
         ref = [t.numpy() for t in module(example)]
         pred = ct.models.MLModel(out_path).predict({"image": example.numpy()})
         for name, r in zip(output_names, ref):
