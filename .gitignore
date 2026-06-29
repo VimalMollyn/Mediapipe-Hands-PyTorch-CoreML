@@ -10,3 +10,5 @@ checkpoints/
 wandb/
 *.log
 models/hand_detector_whim*.pt
+models/hand_landmarks_detector_whim*.pt
+checkpoints_lm/
