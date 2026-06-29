@@ -36,7 +36,8 @@ def _init():
     import torch
     torch.set_num_threads(1)
     from run_mediapipe_pytorch import HandLandmarkerTorch
-    _MODEL = HandLandmarkerTorch(num_hands=1, device="cpu")  # we drive _landmarks directly
+    lm = os.environ.get("LANDMARK_PT", "models/hand_landmarks_detector.pt")
+    _MODEL = HandLandmarkerTorch(landmark_path=lm, num_hands=1, device="cpu")
 
 
 def _project(P3, K, trans):
@@ -106,7 +107,13 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--workers", type=int, default=7)
     ap.add_argument("--out", default="eval_landmarks.json")
+    ap.add_argument("--model", default=None,
+                    help="landmark graph .pt (e.g. a fine-tuned "
+                         "models/hand_landmarks_detector_whim.pt); default = pretrained")
     args = ap.parse_args()
+    if args.model:
+        os.environ["LANDMARK_PT"] = args.model
+        print(f"using landmark model: {args.model}", flush=True)
 
     frames = sorted(glob.glob(os.path.join(TEST_ROOT, "*", "*.npy")))
     if args.limit:
