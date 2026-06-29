@@ -149,7 +149,12 @@ class TFLiteModule(torch.nn.Module):
                 xin = get(ins[0])
                 if o["from_4d"]:
                     xin = xin.permute(0, 2, 3, 1)  # back to NHWC semantics
-                y = xin.reshape(o["shape"])
+                # The exported shapes bake in batch=1; use the runtime batch size
+                # for dim 0 so the graph also runs batched (training). Identical
+                # for batch=1 (xin.shape[0] == 1), enables N>1 otherwise.
+                shape = list(o["shape"])
+                shape[0] = xin.shape[0]
+                y = xin.reshape(shape)
                 if o["to_4d"]:
                     y = y.permute(0, 3, 1, 2)
                 env[outs[0]] = y

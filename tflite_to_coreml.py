@@ -16,12 +16,6 @@ import torch
 
 from tflite_graph import TFLiteModule
 
-MODELS = [
-    ("models/hand_detector.pt", (1, 192, 192, 3), "models/hand_detector{suffix}.mlpackage"),
-    ("models/hand_landmarks_detector.pt", (1, 224, 224, 3),
-     "models/hand_landmarks_detector{suffix}.mlpackage"),
-]
-
 
 class TupleWrapper(torch.nn.Module):
     """coremltools wants a tuple return, not a list."""
@@ -38,12 +32,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--fp32", action="store_true",
                         help="convert at float32 (CPU/GPU only, closer to pytorch)")
+    parser.add_argument("--detector", default="models/hand_detector.pt",
+                        help="detector graph .pt (e.g. a fine-tuned *_whim.pt)")
+    parser.add_argument("--landmark", default="models/hand_landmarks_detector.pt",
+                        help="landmark graph .pt (e.g. a fine-tuned *_whim.pt)")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="skip the predict() sanity check (needs macOS runtime)")
     args = parser.parse_args()
 
     precision = ct.precision.FLOAT32 if args.fp32 else ct.precision.FLOAT16
     suffix = "_fp32" if args.fp32 else ""
 
-    for pt_path, shape, out_tmpl in MODELS:
+    # .mlpackage is named after the input .pt (so *_whim.pt -> *_whim.mlpackage)
+    models = [(args.detector, (1, 192, 192, 3)), (args.landmark, (1, 224, 224, 3))]
+    for pt_path, shape in models:
+        out_tmpl = pt_path[:-3] + "{suffix}.mlpackage"
         module = TFLiteModule(pt_path).eval()
         output_names = [module.names[i] for i in module.output_ids]
         example = torch.rand(shape)
@@ -59,8 +62,11 @@ def main():
         )
         out_path = out_tmpl.format(suffix=suffix)
         mlmodel.save(out_path)
+        print(f"saved {out_path}", flush=True)
 
-        # sanity check against the torch module
+        if args.no_verify:
+            continue
+        # sanity check against the torch module (needs the macOS CoreML runtime)
         ref = [t.numpy() for t in module(example)]
         pred = ct.models.MLModel(out_path).predict({"image": example.numpy()})
         for name, r in zip(output_names, ref):
