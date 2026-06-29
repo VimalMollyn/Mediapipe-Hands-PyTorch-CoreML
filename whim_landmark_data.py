@@ -125,10 +125,10 @@ class WHIMLandmarkDataModule(L.LightningDataModule):
 
     def train_dataloader(self):
         return DataLoader(self.train_set, batch_size=self.hparams.batch_size, shuffle=True,
-                          num_workers=self.hparams.num_workers, pin_memory=True,
+                          num_workers=self.hparams.num_workers, pin_memory=False,
                           drop_last=True, persistent_workers=True)
 
     def val_dataloader(self):
         return DataLoader(self.val_set, batch_size=self.hparams.batch_size, shuffle=False,
-                          num_workers=self.hparams.num_workers, pin_memory=True,
+                          num_workers=self.hparams.num_workers, pin_memory=False,
                           persistent_workers=True)
